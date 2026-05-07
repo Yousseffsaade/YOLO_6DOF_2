@@ -1202,6 +1202,8 @@ MonoBehaviour:
   fallbackToFixedDepth: 1
   minPnPDepth: 0.25
   maxPnPDepth: 3
+  positionOffset: {x: 0, y: -0.25, z: 0}
+  rotationOffsetEuler: {x: 0, y: 0, z: 0}
 --- !u!1 &1477114056
 GameObject:
   m_ObjectHideFlags: 0

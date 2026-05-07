@@ -73,6 +73,16 @@ public class YoloUnityDetector : MonoBehaviour
     [Tooltip("Maximum accepted SolvePnP distance from camera.")]
     public float maxPnPDepth = 3.0f;
 
+    [Header("Parallax Correction (camera-to-eye offset on Quest 3)")]
+    [Tooltip("Shifts the virtual object in world space to align with real object in passthrough view. " +
+             "With bottle stationary on desk: increase X to shift right, Y to shift up, Z to shift toward you. " +
+             "Start with small steps (~0.03). This compensates the physical offset between passthrough cameras and eyes.")]
+    public Vector3 positionOffset = Vector3.zero;
+
+    [Header("Rotation Offset (fine-tuning on top of hardcoded -90X fix)")]
+    [Tooltip("Additional rotation applied after the built-in -90X model axis correction. E.g. (180,0,0) if bottle is upside-down.")]
+    public Vector3 rotationOffsetEuler = Vector3.zero;
+
     private Worker worker;
     private WebCamTexture webcamTexture;
     private RenderTexture _resizeRT;
@@ -97,6 +107,15 @@ public class YoloUnityDetector : MonoBehaviour
     private bool smoothBboxInitialised = false;
 
     private int lostFrames = 0;
+
+    // Performance metrics
+    private float _renderFps = 0f;
+    private float _detectionFps = 0f;
+    private float _pipelineMs = 0f;
+    private float _inferenceMs = 0f;
+    private float _solvePnPMs = 0f;
+    private float _lastDetectionTimestamp = -1f;
+    private float _frameStart = 0f;
 
     private Component _cameraAccessComponent;
     private MethodInfo _getCameraPoseMethod;
@@ -192,6 +211,9 @@ public class YoloUnityDetector : MonoBehaviour
             return;
         }
 
+        _renderFps = 1f / Time.deltaTime;
+        _frameStart = Time.realtimeSinceStartup;
+
         Pose camPose = Pose.identity;
 
         if (_cameraAccessComponent != null)
@@ -231,6 +253,8 @@ public class YoloUnityDetector : MonoBehaviour
             Debug.Log($"[YOLO] webcam center pixel: r={sample.r:F2} g={sample.g:F2} b={sample.b:F2} size={webcamTexture.width}x{webcamTexture.height}");
         }
 
+        float inferenceStart = Time.realtimeSinceStartup;
+
         TextureConverter.ToTensor(_resizeRT, _inputTensor, new TextureTransform());
         worker.Schedule(_inputTensor);
 
@@ -244,6 +268,8 @@ public class YoloUnityDetector : MonoBehaviour
 
         Tensor<float> readableOutput = outputFloat.ReadbackAndClone();
         float[] data = readableOutput.DownloadToArray();
+
+        _inferenceMs = (Time.realtimeSinceStartup - inferenceStart) * 1000f;
 
         float bestConf = 0f;
         int bestIndex = -1;
@@ -331,6 +357,7 @@ public class YoloUnityDetector : MonoBehaviour
 
         if (useSolvePnP)
         {
+            float pnpStart = Time.realtimeSinceStartup;
             pnpOK = TrySolvePnP(
                 smoothX,
                 smoothY,
@@ -341,6 +368,7 @@ public class YoloUnityDetector : MonoBehaviour
                 out pnpCameraPosition,
                 out pnpCameraRotation
             );
+            _solvePnPMs = (Time.realtimeSinceStartup - pnpStart) * 1000f;
 
             if (pnpOK)
             {
@@ -348,7 +376,8 @@ public class YoloUnityDetector : MonoBehaviour
                     camPose.position +
                     camPose.right * pnpCameraPosition.x +
                     camPose.up * pnpCameraPosition.y +
-                    camPose.forward * pnpCameraPosition.z;
+                    camPose.forward * pnpCameraPosition.z +
+                    positionOffset;
 
                 worldRot = camPose.rotation * pnpCameraRotation;
             }
@@ -422,11 +451,21 @@ public class YoloUnityDetector : MonoBehaviour
             trackedObject.gameObject.SetActive(true);
             trackedObject.position = smoothPos;
             if (pnpOK)
-                trackedObject.rotation = smoothRot;
+            {
+                // Euler(-90,0,0): model's local Z (tall axis, Blender Z-up) → world Y (up).
+                // If bottle is upside-down after this build, change -90 to +90 here.
+                Quaternion modelAxisFix = Quaternion.Euler(-90f, 0f, 0f);
+                trackedObject.rotation = smoothRot * modelAxisFix * Quaternion.Euler(rotationOffsetEuler);
+            }
         }
 
         float normX = (smoothX / InputSize) - 0.5f;
         float normY = -((smoothY / InputSize) - 0.5f);
+
+        _pipelineMs = (Time.realtimeSinceStartup - _frameStart) * 1000f;
+        float now = Time.realtimeSinceStartup;
+        _detectionFps = _lastDetectionTimestamp > 0f ? 1f / (now - _lastDetectionTimestamp) : 0f;
+        _lastDetectionTimestamp = now;
 
         string debugMessage =
             "YOLO + OPENCV SOLVEPNP\n\n" +
@@ -470,17 +509,25 @@ public class YoloUnityDetector : MonoBehaviour
             $"y = {smoothPos.y:F2}\n" +
             $"z = {smoothPos.z:F2}\n\n" +
 
-            $"Lost frames: {lostFrames}";
+            $"Lost frames: {lostFrames}\n\n" +
+
+            "--- Performance ---\n" +
+            $"Render FPS:    {_renderFps:F1}\n" +
+            $"Detection FPS: {_detectionFps:F1}\n" +
+            $"Pipeline:      {_pipelineMs:F1} ms\n" +
+            $"  Inference:   {_inferenceMs:F1} ms\n" +
+            $"  SolvePnP:    {_solvePnPMs:F1} ms";
 
         SetDebugText(debugMessage);
 
         if (verboseConsoleLog)
             Debug.Log(
                 $"[YOLO] conf={bestConf:F2} " +
-                $"raw=({x:F1},{y:F1}) smooth=({smoothX:F1},{smoothY:F1}) " +
                 $"pnp={(pnpOK ? "OK" : "FAIL")} " +
                 $"cam=({pnpCameraPosition.x:F2},{pnpCameraPosition.y:F2},{pnpCameraPosition.z:F2}) " +
-                $"world=({worldPos.x:F2},{worldPos.y:F2},{worldPos.z:F2})"
+                $"world=({worldPos.x:F2},{worldPos.y:F2},{worldPos.z:F2}) | " +
+                $"renderFPS={_renderFps:F1} detFPS={_detectionFps:F1} " +
+                $"pipeline={_pipelineMs:F1}ms infer={_inferenceMs:F1}ms pnp={_solvePnPMs:F1}ms"
             );
 
         readableOutput.Dispose();
@@ -532,11 +579,15 @@ public class YoloUnityDetector : MonoBehaviour
         float top = bboxCenterY - halfH;
         float bottom = bboxCenterY + halfH;
 
+        // Y is negated to match OpenCV's Y-down image convention.
+        // TL/TR get -halfH (top of image = small v = negative Y in OpenCV 3D),
+        // BR/BL get +halfH (bottom of image = large v = positive Y in OpenCV 3D).
+        // This makes solvePnP return near-identity rotation when bottle faces camera straight-on.
         MatOfPoint3f objectPoints = new MatOfPoint3f(
-            new Point3(-bottleWidthMeters / 2.0,  bottleHeightMeters / 2.0, 0),
-            new Point3( bottleWidthMeters / 2.0,  bottleHeightMeters / 2.0, 0),
+            new Point3(-bottleWidthMeters / 2.0, -bottleHeightMeters / 2.0, 0),
             new Point3( bottleWidthMeters / 2.0, -bottleHeightMeters / 2.0, 0),
-            new Point3(-bottleWidthMeters / 2.0, -bottleHeightMeters / 2.0, 0)
+            new Point3( bottleWidthMeters / 2.0,  bottleHeightMeters / 2.0, 0),
+            new Point3(-bottleWidthMeters / 2.0,  bottleHeightMeters / 2.0, 0)
         );
 
         MatOfPoint2f imagePoints = new MatOfPoint2f(
@@ -568,6 +619,8 @@ public class YoloUnityDetector : MonoBehaviour
 
         try
         {
+            // SQPNP is more robust than ITERATIVE for coplanar/near-coplanar point sets.
+            // ITERATIVE can oscillate between the two ambiguous poses when rvec ≈ 0.
             success = Calib3d.solvePnP(
                 objectPoints,
                 imagePoints,
@@ -576,7 +629,7 @@ public class YoloUnityDetector : MonoBehaviour
                 rvec,
                 tvec,
                 false,
-                Calib3d.SOLVEPNP_ITERATIVE
+                Calib3d.SOLVEPNP_SQPNP
             );
 
             if (!success)
